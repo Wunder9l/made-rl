@@ -65,7 +65,7 @@ class Actor(nn.Module):
     def compute_proba(self, state, action):
         # Returns probability of action according to current policy and distribution of actions
         distrib = self.get_action_distribution(state)
-        return distrib.log_prob(action).sum(-1)
+        return distrib.log_prob(action.to(self.device)).sum(-1)
 
     def get_action_distribution(self, state: torch.Tensor):
         # Remember: agent is not deterministic, sample actions from distribution (e.g. Gaussian)
