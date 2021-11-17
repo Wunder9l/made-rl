@@ -4,9 +4,10 @@ from gym import make
 import numpy as np
 import torch
 from torch import nn
-from torch.distributions import Normal
+from torch.distributions import Normal, kl_divergence
 from torch.nn import functional as F
 from torch.optim import Adam
+import tqdm
 import random
 
 ENV_NAME = "Walker2DBulletEnv-v0"
@@ -26,6 +27,7 @@ MIN_TRANSITIONS_PER_UPDATE = 2048
 MIN_EPISODES_PER_UPDATE = 4
 
 ITERATIONS = 1000
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     
 def compute_lambda_returns_and_gae(trajectory):
@@ -46,25 +48,40 @@ def compute_lambda_returns_and_gae(trajectory):
 
 
 class Actor(nn.Module):
-    def __init__(self, state_dim, action_dim):
+    def __init__(self, state_dim, action_dim, device):
         super().__init__()
         # Advice: use same log_sigma for all states to improve stability
         # You can do this by defining log_sigma as nn.Parameter(torch.zeros(...))
-        self.model = None
+        self.model = nn.Sequential(
+            nn.Linear(state_dim, 256),
+            nn.ELU(),
+            nn.Linear(256, 256),
+            nn.ELU(),
+            nn.Linear(256, 2 * action_dim)  # for mu and sigma
+        ).to(device)
         self.sigma = None
+        self.device = device
         
     def compute_proba(self, state, action):
         # Returns probability of action according to current policy and distribution of actions
-        return None
+        distrib = self.get_action_distribution(state)
+        return distrib.log_prob(action).sum(-1)
+
+    def get_action_distribution(self, state: torch.Tensor):
+        # Remember: agent is not deterministic, sample actions from distribution (e.g. Gaussian)
+        mu, log_sigma = torch.chunk(self.model(state.to(self.device)), 2, dim=-1)
+        sigma = torch.exp(log_sigma)
+        return Normal(mu, sigma)  # batch_size x action_size
         
     def act(self, state):
         # Returns an action (with tanh), not-transformed action (without tanh) and distribution of non-transformed actions
-        # Remember: agent is not deterministic, sample actions from distribution (e.g. Gaussian)
-        return None
-        
+        distrib = self.get_action_distribution(state)
+        action = distrib.rsample()
+        action_tahn = torch.tanh(action)
+        return action_tahn, action, distrib
         
 class Critic(nn.Module):
-    def __init__(self, state_dim):
+    def __init__(self, state_dim, device):
         super().__init__()
         self.model = nn.Sequential(
             nn.Linear(state_dim, 256),
@@ -72,18 +89,23 @@ class Critic(nn.Module):
             nn.Linear(256, 256),
             nn.ELU(),
             nn.Linear(256, 1)
-        )
+        ).to(device)
+        self.device = device
         
     def get_value(self, state):
-        return self.model(state)
+        return self.model(state.to(self.device)).squeeze(-1)
 
 
 class PPO:
-    def __init__(self, state_dim, action_dim):
-        self.actor = Actor(state_dim, action_dim)
-        self.critic = Critic(state_dim)
+    def __init__(self, state_dim, action_dim, device):
+        self.actor = Actor(state_dim, action_dim, device)
+        self.critic = Critic(state_dim, device)
+        self.device = device
         self.actor_optim = Adam(self.actor.parameters(), ACTOR_LR)
         self.critic_optim = Adam(self.critic.parameters(), CRITIC_LR)
+        self.beta = 0.4
+        self.d_target = 1000.
+        self.clipping_e = 0.2
 
     def update(self, trajectories):
         transitions = [t for traj in trajectories for t in traj] # Turn a list of trajectories into list of transitions
@@ -93,8 +115,7 @@ class PPO:
         old_prob = np.array(old_prob)
         target_value = np.array(target_value)
         advantage = np.array(advantage)
-        advnatage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
-        
+        advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
         
         for _ in range(BATCHES_PER_UPDATE):
             idx = np.random.randint(0, len(transitions), BATCH_SIZE) # Choose random batch
@@ -102,12 +123,28 @@ class PPO:
             a = torch.tensor(action[idx]).float()
             op = torch.tensor(old_prob[idx]).float() # Probability of the action in state s.t. old policy
             v = torch.tensor(target_value[idx]).float() # Estimated by lambda-returns 
-            adv = torch.tensor(advantage[idx]).float() # Estimated by generalized advantage estimation 
+            adv = torch.tensor(advantage[idx]).float().to(self.device) # Estimated by generalized advantage estimation
             
             # TODO: Update actor here            
             # TODO: Update critic here
-            
-            
+            critic_loss = F.mse_loss(self.critic.get_value(s), v.to(self.device))
+            p = torch.exp(self.actor.compute_proba(s, a))
+
+            r = p / op.to(self.device)
+            clamped_r = torch.clamp(r, 1.0 - self.clipping_e, 1.0 + self.clipping_e)
+            actor_loss = torch.min(r * adv, clamped_r * adv).mean()
+
+            # kullback_leibler = torch.kl_div(p, op)
+            # self.update_beta(kullback_leibler.mean())
+            # actor_loss = p / op * adv - self.beta * kullback_leibler
+
+            loss = actor_loss + critic_loss
+            self.actor_optim.zero_grad()
+            self.critic_optim.zero_grad()
+            loss.backward()
+            self.actor_optim.step()
+            self.critic_optim.step()
+
     def get_value(self, state):
         with torch.no_grad():
             state = torch.tensor(np.array([state])).float()
@@ -123,6 +160,13 @@ class PPO:
 
     def save(self):
         torch.save(self.actor, "agent.pkl")
+
+    def update_beta(self, kl):
+        if kl > self.d_target * 1.5:
+            self.beta *= 2.0
+        elif kl < self.d_target / 1.5:
+            self.beta /= 2.0
+
 
 
 def evaluate_policy(env, agent, episodes=5):
@@ -153,12 +197,12 @@ def sample_episode(env, agent):
 
 if __name__ == "__main__":
     env = make(ENV_NAME)
-    ppo = PPO(state_dim=env.observation_space.shape[0], action_dim=env.action_space.shape[0])
+    ppo = PPO(state_dim=env.observation_space.shape[0], action_dim=env.action_space.shape[0], device=DEVICE)
     state = env.reset()
     episodes_sampled = 0
     steps_sampled = 0
     
-    for i in range(ITERATIONS):
+    for i in tqdm.trange(ITERATIONS):
         trajectories = []
         steps_ctn = 0
         
